@@ -25,7 +25,17 @@ public sealed class Poe2Live
     private readonly Dictionary<nint, string> _meta = new();
     private readonly Dictionary<nint, nint> _iconAddr = new();     // entity → MinimapIcon component (0 = none); game POI
     private readonly Dictionary<nint, Rarity> _rarity = new();     // entity → rarity (static per spawn; cached)
+    private readonly Dictionary<nint, string[]> _mods = new();     // entity → affix mod ids (static per spawn; cached; empty = no mods)
+    private readonly Dictionary<nint, (Rarity rarity, string? art, bool identified)> _itemIdent = new(); // WorldItem entity → dropped-item identity (static; cached)
     private readonly Dictionary<nint, uint> _idAt = new();         // entity address → last-seen std::map key id (recycle guard)
+    // Bounds the number of NEW (uncached) monster mod reads per Entities() pass so walking into a large
+    // pack can't stall the world tick. Cached monsters cost nothing; new ones fill over a few ticks.
+    private int _modReadBudget;
+    private const int ModReadBudgetPerPass = 16;
+    private readonly byte[] _modVecBuf = new byte[24]; // one StdVector (First/Last/End)
+    // Same budgeting for the (cheap, read-once) dropped-item identity reads.
+    private int _itemReadBudget;
+    private const int ItemReadBudgetPerPass = 12;
     private nint _entCacheKey;   // AreaInstance address the entity caches were built for
 
     // Reused across Entities() calls (tick thread only) to avoid per-tick allocations. The std::map
@@ -50,8 +60,19 @@ public sealed class Poe2Live
 
     public readonly record struct EntityDot(
         uint Id, nint Address, System.Numerics.Vector2 Grid, Vector3 World, EntityCategory Category, string Metadata,
-        int HpCur, int HpMax, bool Poi, byte Reaction, Rarity Rarity, bool Opened, bool IconComplete = false)
+        int HpCur, int HpMax, bool Poi, byte Reaction, Rarity Rarity, bool Opened, bool IconComplete = false,
+        IReadOnlyList<string>? Mods = null, string? ItemArt = null, bool ItemIdentified = true)
     {
+        // ItemIdentified (positional): for a dropped unique, whether the game has identified it (Mods+0x90).
+        // Drives the loot overlay's unique rule — unID → reveal the resolved name; ID → value only. Defaults
+        // true so non-item / non-unique entities are never treated as "unidentified".
+        /// <summary>The monster's affix mod ids (auras/buffs), never null. Empty for non-monsters,
+        /// unrolled monsters, or before the budgeted mod read has filled this entity in.</summary>
+        public IReadOnlyList<string> ModList => Mods ?? Array.Empty<string>();
+        // ItemArt (positional): for a dropped-item (WorldItem) entity, the basename of its 2D art (.dds),
+        // e.g. "Earthbound" — the price-lookup key (matches poe2scout IconUrl basename). Null for non-items
+        // / not-yet-read. When set, Rarity carries the dropped item's rarity (Unique=3) for gating.
+
         /// <summary>Monsters are "alive" only with positive HP; non-life entities are always shown.</summary>
         public bool IsAlive => HpMax <= 0 || HpCur > 0;
         public bool HasLife => HpMax > 0;
@@ -155,54 +176,103 @@ public sealed class Poe2Live
     /// <summary>Player grid position (from the Render component's world position ÷ grid ratio).</summary>
     public System.Numerics.Vector2? PlayerGrid(nint localPlayer) => EntityGrid(localPlayer);
 
-    public readonly record struct Vitals(int HpCur, int HpUnreserved, int ManaCur, int ManaUnreserved)
+    public readonly record struct Vitals(int HpCur, int HpUnreserved, int ManaCur, int ManaUnreserved,
+        int EsCur, int EsUnreserved)
     {
         public float HpPct   => HpUnreserved   > 0 ? 100f * HpCur   / HpUnreserved   : 100f;
         public float ManaPct => ManaUnreserved > 0 ? 100f * ManaCur / ManaUnreserved : 100f;
+        // ES% is 100 when there is no ES pool (Max 0, or the offset couldn't be confirmed) so an
+        // "ES" / "Either" flask trigger never fires on a build that has no shield to restore.
+        public float EsPct   => EsUnreserved   > 0 ? 100f * EsCur   / EsUnreserved   : 100f;
+        public bool  HasEs   => EsUnreserved > 0;
     }
 
     private nint _plLife, _plLifeFor;
 
     // Self-healing vital offsets. Components are resolved by NAME (robust across patches), but the
     // VitalStruct offsets WITHIN the Life component slide between patches (e.g. 2026-06-04: Health
-    // 0x1A8→0x1B0). We validate the configured offset against a live Life component once; if it
-    // doesn't read a valid pool, we scan the component for its VitalStructs (ascending order =
-    // Health, Mana, ES) and use those for the session — so a minor layout shift degrades gracefully
-    // (auto-flask + HP bars keep working) instead of silently reading 0. The same offsets back the
-    // monster HP reads (identical component layout). Logged loudly so the table still gets updated.
-    private int _healthOff = Poe2.Life.Health, _manaOff = Poe2.Life.Mana;
+    // 0x1A8→0x1B0, Mana 0x1F8→0x208, ES 0x230→0x248 — each by a different small amount). We validate
+    // each configured offset against a live Life component once; if it doesn't read a valid pool we
+    // re-anchor it (see ResolveVitalOffset) so a minor layout shift degrades gracefully (auto-flask +
+    // HP bars keep working) instead of silently reading 0. The same offsets back the monster HP reads
+    // (identical component layout). Logged loudly so the table still gets updated.
+    //
+    // Health and ES BOTH self-heal; Mana is best-effort (kept for the mana flask but never gated on).
+    // _esOffKnown gates the ES read: if ES can't be confirmed near its offset we suppress the read
+    // entirely (→ ES% reads 100 → the ES/Either trigger never fires) rather than risk reading a decoy
+    // and misfiring the flask.
+    private int _healthOff = Poe2.Life.Health, _manaOff = Poe2.Life.Mana, _esOff = Poe2.Life.EnergyShield;
+    private bool _esOffKnown = true;
     private bool _vitalOffsetsResolved;
+
+    // Stricter than VitalStruct.LooksValid: ReservedFraction is reservation in basis-points, so a real
+    // pool keeps it in [0, 10000]. The Life component is littered with decoy structs that pass the
+    // loose check but carry out-of-range/garbage ReservedFraction — this filters most of them out.
+    private static bool LooksLikeRealPool(in VitalStruct v)
+        => v.LooksValid() && v.ReservedFraction >= 0 && v.ReservedFraction <= 10000;
+
+    // Resolve one pool's offset within the Life component, healing small drift. Returns the configured
+    // offset if it still reads a valid pool (the normal case); otherwise searches a TIGHT window
+    // anchored on the configured offset and returns the valid pool nearest to it, or -1 if none. The
+    // window is deliberately narrow so the distant decoy VitalStructs (verified live to sit well away
+    // from each real pool) stay out of reach — we heal a slide, we don't hunt blindly.
+    private int ResolveVitalOffset(nint lifeComp, int configured)
+    {
+        if (_reader.TryReadStruct<VitalStruct>(lifeComp + configured, out var v) && v.LooksValid())
+            return configured;
+        int best = -1, bestDist = int.MaxValue;
+        for (var off = Math.Max(0x80, configured - 0x18); off <= configured + 0x30; off += 4)
+        {
+            if (_reader.TryReadStruct<VitalStruct>(lifeComp + off, out var c) && LooksLikeRealPool(c))
+            {
+                var d = Math.Abs(off - configured);
+                if (d < bestDist) { bestDist = d; best = off; }
+            }
+        }
+        return best;
+    }
 
     private void EnsureVitalOffsets(nint lifeComp)
     {
         if (_vitalOffsetsResolved || lifeComp == 0) return;
-        // Fast path: the configured Health offset already reads a valid pool — nothing to do (no scan).
-        if (_reader.TryReadStruct<VitalStruct>(lifeComp + Poe2.Life.Health, out var h) && h.LooksValid())
-        { _vitalOffsetsResolved = true; return; }
 
-        // Drifted (or not loaded yet): scan the component for valid VitalStructs. After a hit, jump
-        // past the struct's extent so the overlapping +4 false-positive isn't counted as a 2nd pool.
-        var found = new List<int>(4);
-        for (var off = 0x80; off <= 0x400 && found.Count < 4;)
+        // Health is safety-critical and reliably the FIRST valid pool, so it gets an extra fallback:
+        // if it won't anchor near its configured offset, take the first valid pool in the component.
+        var health = ResolveVitalOffset(lifeComp, Poe2.Life.Health);
+        if (health < 0)
         {
-            if (_reader.TryReadStruct<VitalStruct>(lifeComp + off, out var v) && v.LooksValid())
-            { found.Add(off); off += 0x34; }
-            else off += 4;
+            for (var off = 0x80; off <= 0x400; off += 4)
+                if (_reader.TryReadStruct<VitalStruct>(lifeComp + off, out var v) && LooksLikeRealPool(v)) { health = off; break; }
+            if (health < 0) return; // not in-game yet / unreadable — retry next call (don't latch)
         }
-        if (found.Count == 0) return; // not in-game yet / unreadable — retry next call (don't latch)
 
         _vitalOffsetsResolved = true;
-        // Relocate HEALTH ONLY. It's reliably the FIRST valid pool in the component, and it's the
-        // safety-critical flask. Mana is deliberately NOT auto-guessed: the component holds other
-        // valid-looking VitalStructs between Health and Mana (verified live — an ordinal "2nd pool =
-        // Mana" guess lands on the wrong one), and driving the mana flask off the wrong pool is worse
-        // than not firing it. If Mana's offset drifts it just reads 0 (→ mana% 100 → no misfire) until
-        // the table is updated. Health self-heals; mana degrades safely.
-        _healthOff = found[0];
+        _healthOff = health;
         if (_healthOff != Poe2.Life.Health)
             Console.WriteLine($"Poe2Live: Life Health offset appears to have drifted — auto-relocated " +
                 $"0x{Poe2.Life.Health:X}->0x{_healthOff:X} (life flask + HP bars keep working). Update " +
-                $"Poe2.Life + re-validate (Research --hp); mana flask needs the offset table updated.");
+                $"Poe2.Life + re-validate (Research --vitals).");
+
+        // ES self-heals the same way; if it can't be confirmed we suppress the read (safe: ES% → 100).
+        var es = ResolveVitalOffset(lifeComp, Poe2.Life.EnergyShield);
+        _esOffKnown = es >= 0;
+        if (es >= 0)
+        {
+            _esOff = es;
+            if (_esOff != Poe2.Life.EnergyShield)
+                Console.WriteLine($"Poe2Live: Life EnergyShield offset appears to have drifted — auto-relocated " +
+                    $"0x{Poe2.Life.EnergyShield:X}->0x{_esOff:X} (ES flask keeps working). Update Poe2.Life + re-validate (Research --vitals).");
+        }
+        else
+        {
+            Console.WriteLine($"Poe2Live: Life EnergyShield offset (0x{Poe2.Life.EnergyShield:X}) couldn't be confirmed — " +
+                "ES flask trigger suppressed (reads as full) until the table is updated (Research --vitals).");
+        }
+
+        // Mana: best-effort relocation only. The mana flask is never gated on a confident read — if it
+        // drifts past the window it keeps the configured offset (reads 0 → mana% 100 → no misfire).
+        var mana = ResolveVitalOffset(lifeComp, Poe2.Life.Mana);
+        if (mana >= 0) _manaOff = mana;
     }
 
     /// <summary>
@@ -218,7 +288,9 @@ public sealed class Poe2Live
         EnsureVitalOffsets(_plLife);
         if (!_reader.TryReadStruct<VitalStruct>(_plLife + _healthOff, out var hp) || hp.Max <= 0) return null;
         _reader.TryReadStruct<VitalStruct>(_plLife + _manaOff, out var mana);
-        return new Vitals(hp.Current, Unreserved(hp), mana.Current, Unreserved(mana));
+        VitalStruct es = default; // suppressed (stays 0 → ES% 100) when the offset isn't confirmed
+        if (_esOffKnown) _reader.TryReadStruct<VitalStruct>(_plLife + _esOff, out es);
+        return new Vitals(hp.Current, Unreserved(hp), mana.Current, Unreserved(mana), es.Current, Unreserved(es));
     }
 
     private static int Unreserved(VitalStruct v)
@@ -237,7 +309,7 @@ public sealed class Poe2Live
         if (areaInstance != _entCacheKey)
         {
             _renderAddr.Clear(); _lifeAddr.Clear(); _posAddr.Clear(); _ompAddr.Clear(); _chestAddr.Clear();
-            _category.Clear(); _meta.Clear(); _iconAddr.Clear(); _rarity.Clear(); _idAt.Clear();
+            _category.Clear(); _meta.Clear(); _iconAddr.Clear(); _rarity.Clear(); _mods.Clear(); _itemIdent.Clear(); _idAt.Clear();
             _entCacheKey = areaInstance;
         }
 
@@ -249,6 +321,8 @@ public sealed class Poe2Live
         var root = Ptr(head + Poe2.StdMapNode.Parent);
         _entQueue.Clear(); _entQueue.Enqueue(root);
         _entVisited.Clear();
+        _modReadBudget = ModReadBudgetPerPass;
+        _itemReadBudget = ItemReadBudgetPerPass;
         while (_entQueue.Count > 0 && _entVisited.Count < 200000)
         {
             var node = _entQueue.Dequeue();
@@ -286,10 +360,18 @@ public sealed class Poe2Live
             if (cat is EntityCategory.Monster or EntityCategory.Player) (hpCur, hpMax) = ReadHp(entity);
             if (cat is EntityCategory.Monster or EntityCategory.Chest) rarity = ReadRarity(entity);
             if (cat == EntityCategory.Chest) opened = ReadChestOpened(entity);
+            var mods = cat == EntityCategory.Monster ? ReadMods(entity) : null;
+            var meta = _meta.GetValueOrDefault(entity, "");
+            // Dropped items (WorldItem containers, categorized Other) carry a price-lookup identity: art
+            // basename + rarity, read once off the inner item entity. Rarity then reflects the item.
+            string? itemArt = null;
+            var itemIdentified = true;
+            if (cat == EntityCategory.Other && meta.Contains("WorldItem", StringComparison.Ordinal))
+                (rarity, itemArt, itemIdentified) = ReadItemIdentity(entity);
 
             var (poi, iconComplete) = ReadIcon(entity);
-            dots.Add(new EntityDot(id, entity, g, wv, cat, _meta.GetValueOrDefault(entity, ""), hpCur, hpMax,
-                poi, ReadReaction(entity), rarity, opened, iconComplete));
+            dots.Add(new EntityDot(id, entity, g, wv, cat, meta, hpCur, hpMax,
+                poi, ReadReaction(entity), rarity, opened, iconComplete, mods, itemArt, itemIdentified));
         }
         return dots;
     }
@@ -300,7 +382,7 @@ public sealed class Poe2Live
     {
         _renderAddr.Remove(entity); _lifeAddr.Remove(entity); _posAddr.Remove(entity);
         _ompAddr.Remove(entity); _chestAddr.Remove(entity); _category.Remove(entity);
-        _meta.Remove(entity); _iconAddr.Remove(entity); _rarity.Remove(entity);
+        _meta.Remove(entity); _iconAddr.Remove(entity); _rarity.Remove(entity); _mods.Remove(entity); _itemIdent.Remove(entity);
     }
 
     /// <summary>
@@ -339,6 +421,132 @@ public sealed class Poe2Live
         var rarity = r is >= 0 and <= 3 ? (Rarity)r : Rarity.Normal;
         _rarity[entity] = rarity;
         return rarity;
+    }
+
+    /// <summary>
+    /// The monster's affix mod ids (auras/buffs) from ObjectMagicProperties+Mods. Like rarity, mods are
+    /// fixed at spawn, so the result is cached per entity (even when empty) and read at most once. New
+    /// (uncached) reads are bounded by <see cref="_modReadBudget"/> per pass so a fresh pack fills over a
+    /// few world ticks rather than stalling one. Reads ONLY the rolled-affix vector (+0x168); the +0x150
+    /// rarity-placeholder filler (MonsterRare/Magic/Unique{N}) is intentionally excluded.
+    /// </summary>
+    private string[]? ReadMods(nint entity)
+    {
+        if (_mods.TryGetValue(entity, out var cached)) return cached.Length == 0 ? null : cached;
+        if (_modReadBudget <= 0) return null;                  // out of budget this pass — retry next tick (don't cache)
+
+        if (!_ompAddr.TryGetValue(entity, out var omp))
+        {
+            omp = ResolveComponent(entity, "ObjectMagicProperties");
+            _ompAddr[entity] = omp;
+        }
+        if (omp == 0) { _mods[entity] = Array.Empty<string>(); return null; }
+        _modReadBudget--;
+
+        // StdVector at omp+Mods: [First, Last, End]. Element stride ModElemStride; each element holds a
+        // record pointer at +ModRecordPtr; the record's +ModIdString is a UTF-16 mod-id string.
+        if (_reader.TryReadBytes(omp + Poe2.ObjectMagicProperties.Mods, _modVecBuf) < _modVecBuf.Length)
+            return null; // transient read failure — leave uncached, retry next tick
+        var first = (nint)BitConverter.ToInt64(_modVecBuf, 0);
+        var last = (nint)BitConverter.ToInt64(_modVecBuf, 8);
+        var len = (long)last - first;
+        const int stride = Poe2.ObjectMagicProperties.ModElemStride;
+        if (first == 0 || len <= 0 || len > 0x4000 || len % stride != 0)
+        {
+            _mods[entity] = Array.Empty<string>(); return null; // no/garbage affix vector — cache as empty
+        }
+        var n = (int)(len / stride);
+        if (n > 100) { _mods[entity] = Array.Empty<string>(); return null; }
+
+        var list = new List<string>(n);
+        for (var i = 0; i < n; i++)
+        {
+            var rec = Ptr(first + (nint)(i * stride + Poe2.ObjectMagicProperties.ModRecordPtr));
+            if (rec == 0) continue;
+            var idPtr = Poe2.ObjectMagicProperties.ModIdString == 0 ? rec : Ptr(rec + Poe2.ObjectMagicProperties.ModIdString);
+            if (idPtr == 0) continue;
+            var s = _reader.ReadStringUtf16(idPtr, 64);
+            if (LooksLikeModId(s) && !list.Contains(s)) list.Add(s);
+        }
+        var arr = list.Count == 0 ? Array.Empty<string>() : list.ToArray();
+        _mods[entity] = arr;
+        return arr.Length == 0 ? null : arr;
+    }
+
+    /// <summary>
+    /// Resolve a dropped item's identity for price lookup: unwrap the WorldItem container → inner item
+    /// entity, read its rarity (Mods+0x94) and 2D-art basename (RenderItem+0x28 → UTF-16 .dds path). Like
+    /// other item facts these are fixed once dropped, so the result is cached per entity and read at most
+    /// once; new reads are bounded per pass by <see cref="_itemReadBudget"/>. Returns (rarity, artBasename);
+    /// artBasename is null when the item can't be resolved.
+    /// </summary>
+    private (Rarity, string?, bool) ReadItemIdentity(nint entity)
+    {
+        if (_itemIdent.TryGetValue(entity, out var cached)) return cached;
+        if (_itemReadBudget <= 0) return (Rarity.NonMonster, null, true);   // out of budget — retry next tick (don't cache)
+
+        var wi = ResolveComponent(entity, "WorldItem");
+        var item = wi == 0 ? 0 : Ptr(wi + Poe2.WorldItemComponent.ItemEntity);
+        if (item == 0) { var v = (Rarity.NonMonster, (string?)null, true); _itemIdent[entity] = v; return v; }
+        _itemReadBudget--;
+
+        // Rarity (+0x94) + Identified (+0x90) from the item's Mods component (distinct from monster
+        // ObjectMagicProperties+0x144). Identified defaults true (non-uniques / no Mods comp aren't "unID").
+        var rarity = Rarity.NonMonster;
+        var identified = true;
+        var modsComp = ResolveComponent(item, "Mods");
+        if (modsComp != 0)
+        {
+            if (_reader.TryReadStruct<int>(modsComp + Poe2.ModsComponent.Rarity, out var r) && r is >= 0 and <= 3)
+                rarity = (Rarity)r;
+            if (_reader.TryReadStruct<int>(modsComp + Poe2.ModsComponent.Identified, out var idf))
+                identified = idf != 0;
+        }
+
+        // 2D-art .dds path → basename (the price key). RenderItem+0x28 is a pointer to the UTF-16 path.
+        string? art = null;
+        var renderItem = ResolveComponent(item, "RenderItem");
+        if (renderItem != 0)
+        {
+            var pathPtr = Ptr(renderItem + Poe2.RenderItemComponent.ResourcePath);
+            if (pathPtr != 0)
+            {
+                var full = _reader.ReadStringUtf16(pathPtr, 128);
+                art = ArtBasename(full);
+            }
+        }
+
+        var result = (rarity, art, identified);
+        _itemIdent[entity] = result;
+        return result;
+    }
+
+    /// <summary>"Art/2DItems/Weapons/.../Uniques/Earthbound.dds" → "Earthbound" (last path segment, no
+    /// extension). Returns null for empty/garbage so callers can ignore it.</summary>
+    private static string? ArtBasename(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        var slash = path.LastIndexOf('/');
+        var start = slash >= 0 ? slash + 1 : 0;
+        var dot = path.LastIndexOf('.');
+        var end = dot > start ? dot : path.Length;
+        if (end <= start) return null;
+        var name = path[start..end];
+        return name.Length >= 2 ? name : null;
+    }
+
+    /// <summary>A GGG mod id is a non-trivial identifier: letters/digits/underscore only, has a letter.</summary>
+    private static bool LooksLikeModId(string s)
+    {
+        if (s.Length is < 3 or > 64) return false;
+        var hasLetter = false;
+        foreach (var c in s)
+        {
+            if (c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z')) { hasLetter = true; continue; }
+            if (c is (>= '0' and <= '9') or '_') continue;
+            return false;
+        }
+        return hasLetter;
     }
 
     private byte ReadReaction(nint entity)
@@ -702,6 +910,30 @@ public sealed class Poe2Live
         if (!_reader.TryReadStruct<Vector3>(render + Poe2.Render.CurrentWorldPosition, out world)) return false;
         if (_lifeAddr.TryGetValue(entity, out var life) && life != 0
             && _reader.TryReadStruct<VitalStruct>(life + _healthOff, out var v)) { hpCur = v.Current; hpMax = v.Max; }
+        return true;
+    }
+
+    /// <summary>The Render + Life component addresses cached for <paramref name="entity"/> by the most
+    /// recent <see cref="Entities"/> walk (0 when not resolved). Lets the world thread CAPTURE these into
+    /// an HP-bar spec so the RENDER thread can read the bar's live pos/HP via <see cref="TryLiveBarAt"/>
+    /// on its OWN reader stack — no shared per-entity cache between threads. Returns false if no Render.</summary>
+    public bool TryBarComponents(nint entity, out nint render, out nint life)
+    {
+        render = _renderAddr.GetValueOrDefault(entity);
+        life = _lifeAddr.GetValueOrDefault(entity);
+        return render != 0;
+    }
+
+    /// <summary>RENDER-RATE bar read from EXPLICIT component addresses (captured off the world thread's
+    /// <see cref="Entities"/> walk via <see cref="TryBarComponents"/>), using THIS instance's reader +
+    /// resolved Health offset. Touches no per-entity cache, so a render-thread <see cref="Poe2Live"/> can
+    /// drive HP bars without sharing state with the world-thread instance. <paramref name="render"/> must
+    /// be non-zero. Returns false on a failed position read.</summary>
+    public bool TryLiveBarAt(nint render, nint life, out Vector3 world, out int hpCur, out int hpMax)
+    {
+        world = default; hpCur = 0; hpMax = 0;
+        if (render == 0 || !_reader.TryReadStruct<Vector3>(render + Poe2.Render.CurrentWorldPosition, out world)) return false;
+        if (life != 0 && _reader.TryReadStruct<VitalStruct>(life + _healthOff, out var v)) { hpCur = v.Current; hpMax = v.Max; }
         return true;
     }
 

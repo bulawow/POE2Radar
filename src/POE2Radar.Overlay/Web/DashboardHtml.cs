@@ -94,6 +94,7 @@ internal static class DashboardHtml
   .bar{height:9px; border:1px solid var(--line); background:#0c0a07; border-radius:1px; overflow:hidden; position:relative}
   .bar > i{display:block; height:100%; transition:width .35s ease}
   .bar.hp > i{background:linear-gradient(90deg,#6e1f18,var(--blood-bright))}
+  .bar.es > i{background:linear-gradient(90deg,#1f6e63,#33e0c4)}
   .bar.mana > i{background:linear-gradient(90deg,#23306e,var(--magic))}
 
   .sect{font-family:"Cinzel","Georgia",serif; font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--gold); margin:24px 0 12px; display:flex; align-items:center; gap:10px}
@@ -155,6 +156,7 @@ internal static class DashboardHtml
   }
   .chip:hover{border-color:var(--gold-deep); color:var(--ink)}
   .chip.on{background:var(--gold-deep); border-color:var(--gold); color:#1a140a; font-weight:600}
+  .chips{display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 12px}
   input[type=search]{
     font-family:inherit; font-size:12px; color:var(--ink); background:#0c0a07;
     border:1px solid var(--line); border-radius:2px; padding:7px 12px; min-width:200px; flex:1;
@@ -360,6 +362,10 @@ internal static class DashboardHtml
         <div class="bar hp"><i id="hpBar" style="width:0"></i></div>
       </div>
       <div class="vital">
+        <div class="vlabel"><span>Energy Shield</span><span class="num" id="esNum">—</span></div>
+        <div class="bar es"><i id="esBar" style="width:0"></i></div>
+      </div>
+      <div class="vital">
         <div class="vlabel"><span>Mana</span><span class="num" id="mpNum">—</span></div>
         <div class="bar mana"><i id="mpBar" style="width:0"></i></div>
       </div>
@@ -394,7 +400,7 @@ internal static class DashboardHtml
         <div class="panel-grid">
           <div class="card" style="grid-column:1/-1">
             <h3>Display Rules <span class="tag">&middot; one ordered ruleset &mdash; first match wins</span></h3>
-            <div class="row"><div class="rl hint-row">The single source of truth for how every entity draws. Each entity is matched <b>top&ndash;to&ndash;bottom</b>; the <b>first enabled rule that matches</b> decides everything &mdash; its icon &amp; color, whether it&rsquo;s hidden, whether it shows an HP bar, and whether it&rsquo;s auto-pathed. Reorder with &#9650;/&#9660; to change precedence. A rule matches on any mix of <i>type, metadata terms, rarity, reaction, life, chest/POI/encounter state</i>; a blank condition means &ldquo;any&rdquo;. No more conflicting filters &mdash; if two rules could match, the higher one wins.</div></div>
+            <div class="row"><div class="rl hint-row">The single source of truth for how every entity draws. Each entity is matched <b>top&ndash;to&ndash;bottom</b>; the <b>first enabled rule that matches</b> decides everything &mdash; its icon &amp; color, whether it&rsquo;s hidden, whether it shows an HP bar, and whether it&rsquo;s auto-pathed. Reorder with &#9650;/&#9660; to change precedence. A rule matches on any mix of <i>type, metadata terms, monster mods (auras/buffs), rarity, reaction, life, chest/POI/encounter state</i>; a blank condition means &ldquo;any&rdquo;. No more conflicting filters &mdash; if two rules could match, the higher one wins.</div></div>
             <div id="drList"></div>
             <div class="controls" style="margin:8px 0 0">
               <button class="addbtn" id="drPick" style="width:auto;margin:0;padding:9px 16px">+ Add from game data…</button>
@@ -542,8 +548,16 @@ internal static class DashboardHtml
           </div>
           <div class="card">
             <h3>Auto-Flask</h3>
+            <div class="row"><div class="rl">Life flask triggers on<small>which pool the life flask key watches &mdash; ES is ignored if your build has none</small></div>
+              <select class="numin selin" data-set="lifeFlaskMode">
+                <option value="Health">Health %</option>
+                <option value="EnergyShield">Energy Shield %</option>
+                <option value="Either">Either (HP or ES)</option>
+              </select></div>
             <div class="row"><div class="rl">Life threshold %<small>tap life flask below this Life %</small></div>
               <input class="numin" type="number" step="1" min="0" max="100" data-set="lifeThresholdPct"></div>
+            <div class="row"><div class="rl">ES threshold %<small>tap life flask below this Energy Shield % (ES / Either modes)</small></div>
+              <input class="numin" type="number" step="1" min="0" max="100" data-set="esThresholdPct"></div>
             <div class="row"><div class="rl">Mana threshold %<small>tap mana flask below this Mana %</small></div>
               <input class="numin" type="number" step="1" min="0" max="100" data-set="manaThresholdPct"></div>
             <div class="row"><div class="rl">Life flask key</div>
@@ -555,6 +569,32 @@ internal static class DashboardHtml
             <div class="row"><div class="rl">Mana cooldown<small>min ms between mana taps</small></div>
               <input class="numin" type="number" step="100" min="0" data-set="manaCooldownMs"></div>
             <div class="row"><div class="rl hint-row">F8 toggles auto-flask in-game. Status: <span id="flaskState">&mdash;</span></div></div>
+          </div>
+          <div class="card">
+            <h3>Ground Item Pricing <span class="tag">&middot; poe2scout</span></h3>
+            <div class="row"><div class="rl">Enabled<small>draw value labels over dropped items</small></div>
+              <label class="sw"><input type="checkbox" data-gi="enabled"><span class="track"></span><span class="knob"></span></label></div>
+            <div class="row"><div class="rl hint-row">Show a label for these categories:</div></div>
+            <div class="chips" id="giCats">
+              <span class="chip" data-gicat="Uniques">Uniques</span>
+              <span class="chip" data-gicat="Runes">Runes</span>
+              <span class="chip" data-gicat="Essences">Essences</span>
+              <span class="chip" data-gicat="Currency">Currency</span>
+              <span class="chip" data-gicat="Fragments">Fragments</span>
+              <span class="chip" data-gicat="Breach">Breach</span>
+              <span class="chip" data-gicat="Ritual">Ritual</span>
+              <span class="chip" data-gicat="Delirium">Delirium</span>
+              <span class="chip" data-gicat="Expedition">Expedition</span>
+            </div>
+            <div class="row"><div class="rl">Unique min value<small>hide uniques worth less than this (Ex)</small></div>
+              <input class="numin" type="number" step="0.1" min="0" data-gi="uniqueMinEx"></div>
+            <div class="row"><div class="rl">Highlight threshold<small>border/emphasis at or above this value (Ex)</small></div>
+              <input class="numin" type="number" step="1" min="0" data-gi="highlightMinEx"></div>
+            <div class="row"><div class="rl">Min listing quantity<small>skip low-confidence mislistings</small></div>
+              <input class="numin" type="number" step="1" min="0" data-gi="minQuantity"></div>
+            <div class="row"><div class="rl">League<small>blank = auto-detect current</small></div>
+              <input class="numin" type="text" data-gi="league" style="width:150px"></div>
+            <div class="row"><div class="rl hint-row">Uniques show the value always; the resolved NAME shows only while the item is <i>unidentified</i>. Runes / essences / currency show the value only.</div></div>
           </div>
         </div>
         <div style="margin-top:18px; height:14px"><span class="saved" id="savedMsg">&#10003; saved to config</span></div>
@@ -607,8 +647,37 @@ async function loadSettings(){
     });
     hpBars = s.hpBars || null;
     terrain = s.terrain || null;
-    renderHpBars(); renderTerrain();
+    gi = s.groundItems || {};
+    renderHpBars(); renderTerrain(); renderGround();
   }catch(e){}
+}
+
+/* ── ground-item pricing (nested object: POST the whole {groundItems}) ── */
+let gi = null;
+function renderGround(){
+  if(!gi) return;
+  $$('[data-gi]').forEach(el=>{
+    const k=el.dataset.gi;
+    if(el.type==='checkbox') el.checked=!!gi[k];
+    else if(gi[k]!==undefined && gi[k]!==null) el.value=gi[k];
+  });
+  const cats=new Set((gi.categories||[]).map(c=>(c||'').toLowerCase()));
+  $$('#giCats .chip').forEach(c=>c.classList.toggle('on', cats.has(c.dataset.gicat.toLowerCase())));
+}
+function saveGround(){ if(gi) saveSetting('groundItems', gi); }
+function wireGround(){
+  $$('[data-gi]').forEach(el=>{
+    const k=el.dataset.gi;
+    if(el.type==='checkbox') el.onchange=()=>{ gi=gi||{}; gi[k]=el.checked; saveGround(); };
+    else if(el.type==='text') el.onchange=()=>{ gi=gi||{}; gi[k]=el.value.trim(); saveGround(); };
+    else el.onchange=()=>{ const v=parseFloat(el.value); if(!isNaN(v)){ gi=gi||{}; gi[k]=v; saveGround(); } };
+  });
+  $$('#giCats .chip').forEach(c=>c.onclick=()=>{
+    c.classList.toggle('on');
+    gi=gi||{};
+    gi.categories=$$('#giCats .chip.on').map(x=>x.dataset.gicat);
+    saveGround();
+  });
 }
 async function saveSetting(key,val){
   try{
@@ -621,6 +690,7 @@ function wireSettings(){
     const k=el.dataset.set;
     if(el.type==='checkbox') el.onchange=()=>saveSetting(k,el.checked);
     else if(el.classList.contains('keyin')) el.onchange=()=>{ const vk=charToVk(el.value); if(vk) saveSetting(k,vk); el.value=vkToChar(vk); };
+    else if(el.tagName==='SELECT') el.onchange=()=>saveSetting(k,el.value); // string value (e.g. flask mode)
     else el.onchange=()=>{ const v=parseFloat(el.value); if(!isNaN(v)) saveSetting(k,v); };
   });
 }
@@ -796,9 +866,18 @@ let hidden=[], drules=[];
 function flashF(){ const m=$('#savedMsgF'); if(!m) return; m.classList.add('show'); clearTimeout(m._t); m._t=setTimeout(()=>m.classList.remove('show'),1100); }
 async function postHidden(body){ try{ await fetch('/api/hidden',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); flashF(); }catch(e){} }
 async function loadFilters(){
+  await loadModVocab();   // populate the mods autocomplete BEFORE rendering rule rows reference it
   await loadDrules();
   try{ const h=await getJSON('/api/hidden'); hidden=h.patterns||[]; }catch(e){ hidden=[]; }
   renderHidden();
+}
+/* The persistent monster-mod catalog feeds the <datalist> the Mods matcher autocompletes against, so
+   you can pick a known aura/buff id instead of recalling it. Refreshed each time the Rules tab loads. */
+async function loadModVocab(){
+  let mods=[]; try{ const r=await getJSON('/api/mods'); mods=(r&&r.mods)||[]; }catch(_){ mods=[]; }
+  let dl=document.getElementById('modVocab');
+  if(!dl){ dl=document.createElement('datalist'); dl.id='modVocab'; document.body.appendChild(dl); }
+  dl.innerHTML=mods.map(m=>`<option value="${esc(m)}">`).join('');
 }
 
 /* ── Display Rules: the unified ordered ruleset. The page holds the array, edits it, and re-POSTs
@@ -815,6 +894,7 @@ function drSummary(r){
   const p=[];
   p.push((r.categories&&r.categories.length)?r.categories.join('/'):'any type');
   if(r.match&&r.match.length) p.push('“'+r.match.join(', ')+'”');
+  if(r.mods&&r.mods.length) p.push('mods: '+r.mods.join(', '));
   ['rarity','reaction','life','chest','poi','encounter'].forEach(f=>{ if(r[f]) p.push(r[f]); });
   return esc(p.join(' · '));
 }
@@ -825,6 +905,7 @@ function drRow(r,i){
   const body=open?`<div class="drbody">
       <div class="top"><input class="mname dr-name" value="${esc(r.name)}" placeholder="rule name"></div>
       <input class="matchin dr-match" placeholder="match: metadata terms, comma-separated (blank = any)" value="${esc((r.match||[]).join(', '))}">
+      <input class="matchin dr-mods" list="modVocab" placeholder="monster mods: aura/buff terms, comma-separated (e.g. Aura, ManaSiphon) — blank = any" value="${esc((r.mods||[]).join(', '))}">
       <div class="mcats"><span class="mcats-lbl">Type</span>${DR_CATS.map(c=>
         `<label class="catchip${cats.includes(c)?' on':''}"><input type="checkbox" class="dr-cat" data-cat="${c}"${cats.includes(c)?' checked':''}>${c}</label>`).join('')}</div>
       <div class="drconds">${DR_SELECTS.map(([f,l,o])=>drSel(f,l,o,r[f])).join('')}</div>
@@ -868,6 +949,7 @@ function renderDrules(){
     const pk=row.querySelector('.iconpick');
     row.querySelector('.dr-name').onchange=e=>{ r.name=e.target.value; save(); };
     row.querySelector('.dr-match').onchange=e=>{ r.match=e.target.value.split(',').map(s=>s.trim()).filter(Boolean); save(); };
+    row.querySelector('.dr-mods').onchange=e=>{ r.mods=e.target.value.split(',').map(s=>s.trim()).filter(Boolean); save(); };
     row.querySelectorAll('.dr-cat').forEach(cb=>cb.onchange=()=>{ r.categories=[...row.querySelectorAll('.dr-cat:checked')].map(c=>c.dataset.cat); cb.closest('.catchip').classList.toggle('on',cb.checked); save(); });
     row.querySelectorAll('.dr-cond').forEach(sel=>sel.onchange=()=>{ r[sel.dataset.f]=sel.value||null; save(); });
     row.querySelector('.dr-hide').onchange=e=>{ r.hide=e.target.checked; row.classList.toggle('hideon',r.hide); save(); };
@@ -1155,9 +1237,9 @@ $$('#atlasViewCatalog,#atlasViewRegion,#atlasViewNodes').forEach(b=>b?.addEventL
 /* ── left rail ── */
 function renderState(){
   const s=state; if(!s) return;
-  const hp=Math.max(0,Math.min(100,s.hpPct||0)), mp=Math.max(0,Math.min(100,s.manaPct||0));
-  $('#hpBar').style.width=hp+'%'; $('#mpBar').style.width=mp+'%';
-  $('#hpNum').textContent=hp.toFixed(0)+'%'; $('#mpNum').textContent=mp.toFixed(0)+'%';
+  const hp=Math.max(0,Math.min(100,s.hpPct||0)), mp=Math.max(0,Math.min(100,s.manaPct||0)), es=Math.max(0,Math.min(100,s.esPct||0));
+  $('#hpBar').style.width=hp+'%'; $('#mpBar').style.width=mp+'%'; $('#esBar').style.width=es+'%';
+  $('#hpNum').textContent=hp.toFixed(0)+'%'; $('#mpNum').textContent=mp.toFixed(0)+'%'; $('#esNum').textContent=es.toFixed(0)+'%';
   const areaName=(s.areaName&&s.areaName!==s.areaCode)?s.areaName:'';
   $('#kAreaName').textContent=areaName||s.areaCode||'—';
   $('#kArea').textContent=s.areaCode||'—';
@@ -1192,7 +1274,7 @@ async function checkVersion(){
   }catch(e){}
 }
 
-wireSettings(); wireHpBars(); wireTerrain();
+wireSettings(); wireHpBars(); wireTerrain(); wireGround();
 loadIcons().then(()=>{ loadSettings(); loadFilters(); }); // Rules is the default tab
 tick(); setInterval(tick, 1000);
 checkVersion();

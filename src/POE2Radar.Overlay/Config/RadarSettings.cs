@@ -92,7 +92,12 @@ public sealed class RadarSettings
     public bool AtlasShowRoute { get; set; } = true;
 
     // ── Auto-flask thresholds + per-flask cooldowns (milliseconds). ──
+    // What the (single) life-flask key triggers on: "Health" watches HP% only (default — unchanged
+    // behavior), "EnergyShield" watches ES% only (for CI / ES-stacking builds), "Either" fires when
+    // EITHER pool drops below its own threshold. ES is ignored when the build has no ES pool.
+    public string LifeFlaskMode { get; set; } = "Health";
     public float LifeThresholdPct { get; set; } = 65f;
+    public float EsThresholdPct { get; set; } = 50f;
     public float ManaThresholdPct { get; set; } = 30f;
     public int LifeCooldownMs { get; set; } = 2500;
     public int ManaCooldownMs { get; set; } = 2000;
@@ -114,6 +119,9 @@ public sealed class RadarSettings
 
     // ── Walkable-terrain bitmap colors/transparency. Defaults reproduce the old hardcoded wash. ──
     public TerrainSettings Terrain { get; set; } = new();
+
+    // ── Ground-item value overlay (unique drops): name + price over the loot icon, border if above value. ──
+    public GroundItemSettings GroundItems { get; set; } = new();
 
     private static readonly JsonSerializerOptions Json = new()
     {
@@ -318,6 +326,26 @@ public sealed class TerrainSettings
     public float InteriorOpacity { get; set; } = 0.118f; // → 30/255
     public string EdgeColor { get; set; } = "#3CDCFF";
     public float EdgeOpacity { get; set; } = 0.706f;      // → 180/255
+}
+
+/// <summary>
+/// Ground-item value overlay: draws a dropped UNIQUE's resolved name + Exalted price over its in-world
+/// loot icon (so unidentified uniques reveal what they are), with a border when the value clears
+/// <see cref="HighlightMinEx"/>. Prices come from the PriceBook (poe2scout). <see cref="League"/> blank =
+/// auto-detect the current league; set it to override. <see cref="MinQuantity"/> filters low-volume
+/// mislistings out of the overlay.
+/// </summary>
+public sealed class GroundItemSettings
+{
+    public bool Enabled { get; set; } = true;
+    public double HighlightMinEx { get; set; } = 10.0;   // border when value ≥ this many Exalted
+    public double UniqueMinEx { get; set; } = 5.0;       // only label uniques worth ≥ this many Exalted (the
+                                                         // ground overlay now shows ONLY unidentified uniques)
+    public int MinQuantity { get; set; } = 2;            // skip listings with fewer than N for sale (confidence)
+    public string League { get; set; } = "";             // blank = auto-detect current league
+    // Which item-value categories get a ground label. Group keys map to poe2scout categories (see
+    // RadarApp.CategoryGroup). Default: uniques + the common stackables. Empty list ⇒ nothing shows.
+    public List<string> Categories { get; set; } = new() { "Uniques", "Runes", "Essences", "Currency" };
 }
 
 /// <summary>
